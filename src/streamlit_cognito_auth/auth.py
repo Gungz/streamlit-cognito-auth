@@ -59,6 +59,34 @@ class CognitoAuthSessionStateManager:
         init_state("auth_reset_password_session")
         init_state("auth_reset_password_username")
         init_state("auth_reset_password_password")
+        init_state("auth_mfa_required")
+        init_state("auth_mfa_session")
+        init_state("auth_mfa_type")
+        init_state("auth_mfa_setup_session")
+    
+    def set_mfa_challenge(self, session: str, mfa_type: str) -> None:
+        """Sets the MFA challenge session in streamlit session state."""
+        st.session_state["auth_mfa_required"] = True
+        st.session_state["auth_mfa_session"] = session
+        st.session_state["auth_mfa_type"] = mfa_type
+
+    def clear_mfa_challenge(self) -> None:
+        """Clears the MFA challenge from streamlit session state."""
+        st.session_state["auth_mfa_required"] = False
+        st.session_state["auth_mfa_session"] = ""
+        st.session_state["auth_mfa_type"] = ""
+
+    def is_mfa_required(self) -> bool:
+        """Returns if MFA challenge is required."""
+        return st.session_state["auth_mfa_required"]
+
+    def get_mfa_session(self) -> Optional[str]:
+        """Returns the MFA session if exists."""
+        return st.session_state.get("auth_mfa_session")
+
+    def get_mfa_type(self) -> Optional[str]:
+        """Returns the MFA type if exists."""
+        return st.session_state.get("auth_mfa_type")
 
     def set_credentials(self, credentials: Credentials) -> None:
         """Saves the credentials to streamlit session state."""
@@ -235,6 +263,7 @@ class CognitoAuthenticatorBase(ABC):
         app_client_secret: Optional[str]=None,
         boto_client: Optional[Any]=None,
         use_cookies: bool=True,
+        app_name: str="Cognito"
     ):
         self.pool_region = pool_id.split("_")[0]
         self.client = boto_client or boto3.client(
@@ -243,6 +272,7 @@ class CognitoAuthenticatorBase(ABC):
         self.pool_id = pool_id
         self.app_client_id = app_client_id
         self.app_client_secret = app_client_secret
+        self.app_name = app_name
 
         self.session_manager = CognitoAuthSessionStateManager()
         self.cookie_manager = (
@@ -337,6 +367,133 @@ class CognitoAuthenticatorBase(ABC):
 class CognitoAuthenticator(CognitoAuthenticatorBase):
     """Authenticates the user with Cognito using custom streamlit UI elements."""
 
+    def _secret_hash(self, username: str) -> str:
+        """Calculate the secret hash for Cognito authentication."""
+        import hmac
+        import base64
+        import hashlib
+        
+        message = username + self.app_client_id
+        dig = hmac.new(
+            key=self.app_client_secret.encode('UTF-8'),
+            msg=message.encode('UTF-8'),
+            digestmod=hashlib.sha256
+        ).digest()
+        
+        return base64.b64encode(dig).decode()
+
+    def _handle_mfa_setup_challenge(self, username: str, session: str) -> bool:
+        """Handle MFA setup challenge by associating a TOTP token."""
+        try:
+            # Add parameters for associate_software_token if client secret exists
+            params = {"Session": session}
+
+            # Start TOTP setup
+            response = self.client.associate_software_token(**params)
+            
+            secret_code = response.get("SecretCode")
+            new_session = response.get("Session")
+            
+            # Store necessary information in session state
+            st.session_state["auth_username"] = username
+            st.session_state["auth_mfa_setup_session"] = new_session
+            st.session_state["auth_mfa_secret"] = secret_code
+            
+            return True
+        except Exception as e:
+            logger.exception(f"Error setting up MFA: {e}")
+            return False
+
+    def _verify_mfa_setup(self, username: str, session: str, verification_code: str) -> bool:
+        """Verify the MFA setup with the provided code."""
+        try:
+            response = self.client.verify_software_token(
+                Session=session,
+                UserCode=verification_code
+            )
+            
+            if response.get("Status") == "SUCCESS":
+                # Prepare challenge responses with SECRET_HASH if client secret exists
+                challenge_responses = {
+                    "USERNAME": username,
+                    "SESSION": response.get("Session")
+                }
+
+                # Add SECRET_HASH if client secret is configured
+                if self.app_client_secret is not None:
+                    challenge_responses["SECRET_HASH"] = self._secret_hash(username)
+
+                # After successful verification, we need to respond to the original MFA_SETUP challenge
+                challenge_response = self.client.respond_to_auth_challenge(
+                    ClientId=self.app_client_id,
+                    ChallengeName="MFA_SETUP",
+                    Session=response.get("Session"),
+                    ChallengeResponses=challenge_responses
+                )
+                
+                # Check if we got tokens back
+                auth_result = challenge_response.get("AuthenticationResult")
+                if auth_result:
+                    credentials = Credentials(
+                        id_token=auth_result["IdToken"],
+                        access_token=auth_result["AccessToken"],
+                        refresh_token=auth_result["RefreshToken"],
+                        expires_in=auth_result["ExpiresIn"],
+                        token_type=auth_result["TokenType"]
+                    )
+                    return self._set_state_login(credentials=credentials)
+                
+            return False
+        except Exception as e:
+            logger.exception(f"Error verifying MFA setup: {e}")
+            return False
+
+    def _show_mfa_setup_form(self, placeholder):
+        """Show MFA setup form with QR code."""
+        with placeholder:
+            cols = st.columns([1, 3, 1])
+            with cols[1]:
+                st.subheader("MFA Setup Required")
+                
+                # Get the secret code from session state
+                secret_code = st.session_state.get("auth_mfa_secret")
+                
+                if secret_code:
+                    st.write("1. Scan this QR code with your authenticator app:")
+                    
+                    # Generate QR code
+                    import qrcode
+                    import io
+                    from base64 import b64encode
+                    
+                    totp_uri = f"otpauth://totp/{st.session_state.get('auth_username')}?secret={secret_code}&issuer={self.app_name}"
+                    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+                    qr.add_data(totp_uri)
+                    qr.make(fit=True)
+                    
+                    img = qr.make_image(fill_color="black", back_color="white")
+                    buffered = io.BytesIO()
+                    img.save(buffered, format="PNG")
+                    img_str = b64encode(buffered.getvalue()).decode()
+                    
+                    st.markdown(f'<img src="data:image/png;base64,{img_str}" alt="QR Code">', unsafe_allow_html=True)
+                    
+                    # Manual entry option
+                    with st.expander("Can't scan the QR code?"):
+                        st.code(secret_code)
+                        st.write("Enter this code manually in your authenticator app")
+                    
+                    st.write("2. Enter the code from your authenticator app:")
+                    
+                    with st.form("mfa_setup_form"):
+                        verification_code = st.text_input("Verification Code", key="mfa_setup_code")
+                        submitted = st.form_submit_button("Verify")
+                        
+                    return submitted, verification_code
+                else:
+                    st.error("Error getting MFA setup information")
+                    return False, None
+
     def _show_login_form(self, placeholder):
         with placeholder:
             cols = st.columns([1, 3, 1])
@@ -400,6 +557,18 @@ class CognitoAuthenticator(CognitoAuthenticatorBase):
         try:
             tokens = aws_srp.authenticate_user()
 
+        except self.client.exceptions.SoftwareTokenMFANotFoundException as e:
+            # TOTP MFA not set up
+            logger.info("TOTP MFA not set up")
+            self._set_state_logout()
+            return False
+
+        except self.client.exceptions.CodeMismatchException as e:
+            # Invalid MFA code
+            logger.info("Invalid MFA code")
+            self._set_state_logout()
+            return False
+
         except pycognito.exceptions.ForceChangePasswordException as e:
             logger.info("Force password reset")
             self._set_reset_password_session(username, password)
@@ -414,15 +583,115 @@ class CognitoAuthenticator(CognitoAuthenticatorBase):
             logger.info("Login not authorized")
             self._set_state_logout()
             return False
-
+        
+        except self.client.exceptions.UserNotConfirmedException as e:
+            logger.info("User not confirmed")
+            self._set_state_logout()
+            return False
+    
+        except pycognito.exceptions.MFAChallengeException as mfa_challenge:
+            # Handle MFA challenge
+            mfa_tokens = mfa_challenge.get_tokens()
+            challenge = mfa_tokens.get("ChallengeName")
+            session = mfa_tokens.get("Session")
+            
+            # Store username for the MFA challenge
+            st.session_state["auth_username"] = username
+            
+            if challenge == "SMS_MFA":
+                self.session_manager.set_mfa_challenge(session, "SMS")
+                return False
+            elif challenge == "SOFTWARE_TOKEN_MFA":
+                self.session_manager.set_mfa_challenge(session, "TOTP")
+                return False
+            else:
+                logger.error(f"Unsupported challenge: {challenge}")
+                self._set_state_logout()
+                return False
+        
+    
         except Exception as e:
             logger.exception(f"Unknown exception during login: {e}")
             self._set_state_logout()
             raise e
 
         else:
-            credentials = Credentials.from_tokens(tokens)
-            return self._set_state_login(credentials=credentials)
+            #print(tokens)
+            
+            # Check if we got tokens (no MFA) or challenge (MFA required)
+            if "AuthenticationResult" in tokens:
+                # No MFA required
+                credentials = Credentials.from_tokens(tokens)
+                return self._set_state_login(credentials=credentials)
+            elif "ChallengeName" in tokens:
+                # Handle MFA challenge
+                challenge = tokens.get("ChallengeName")
+                session = tokens.get("Session")
+                
+                # Store username for the MFA challenge
+                st.session_state["auth_username"] = username
+                
+                if challenge == "MFA_SETUP":
+                    # Handle MFA setup challenge
+                    logger.info("MFA setup required")
+                    if self._handle_mfa_setup_challenge(username, session):
+                        self.session_manager.set_mfa_challenge(session, "SETUP")
+                        return False
+                    else:
+                        logger.error("Failed to initiate MFA setup")
+                        self._set_state_logout()
+                        return False
+                elif challenge == "SMS_MFA":
+                    self.session_manager.set_mfa_challenge(session, "SMS")
+                    return False
+                elif challenge == "SOFTWARE_TOKEN_MFA":
+                    self.session_manager.set_mfa_challenge(session, "TOTP")
+                    return False
+                else:
+                    logger.error(f"Unsupported challenge: {challenge}")
+                    self._set_state_logout()
+                    return False
+            else:
+                logger.error("Unexpected authentication response")
+                self._set_state_logout()
+                return False
+        
+    def _respond_to_mfa_challenge(self, username: str, code: str, session: str, mfa_type: str) -> bool:
+        try:
+            challenge_responses = {
+                "USERNAME": username,
+                "SMS_MFA_CODE": code if mfa_type == "SMS" else None,
+                "SOFTWARE_TOKEN_MFA_CODE": code if mfa_type == "TOTP" else None,
+            }
+            # Remove None values
+            challenge_responses = {k: v for k, v in challenge_responses.items() if v is not None}
+
+            if self.app_client_secret is not None:
+                challenge_responses["SECRET_HASH"] = self._secret_hash(username)
+
+            response = self.client.respond_to_auth_challenge(
+                ClientId=self.app_client_id,
+                ChallengeName="SMS_MFA" if mfa_type == "SMS" else "SOFTWARE_TOKEN_MFA",
+                Session=session,
+                ChallengeResponses=challenge_responses
+            )
+            tokens = response.get("AuthenticationResult")
+            if tokens:
+                credentials = Credentials(
+                    id_token=tokens["IdToken"],
+                    access_token=tokens["AccessToken"],
+                    refresh_token=tokens["RefreshToken"],
+                    expires_in=tokens["ExpiresIn"],
+                    token_type=tokens["TokenType"]
+                )
+                return self._set_state_login(credentials=credentials)
+            return False
+        except self.client.exceptions.CodeMismatchException:
+            logger.info("Invalid MFA code")
+            return False
+        except Exception as e:
+            logger.exception(f"Error responding to MFA challenge: {e}")
+            return False
 
     def _set_reset_password_session(self,
         reset_password_username: str, reset_password_password: str
@@ -460,15 +729,116 @@ class CognitoAuthenticator(CognitoAuthenticatorBase):
             raise e
 
         else:
-            credentials = Credentials.from_tokens(tokens)
-            logged_in = self._set_state_login(credentials=credentials)
-            if logged_in:
-                self.session_manager.clear_reset_password_session()
-            return logged_in
+
+            if "AuthenticationResult" in tokens:
+                # No MFA required
+                credentials = Credentials.from_tokens(tokens)
+                logged_in = self._set_state_login(credentials=credentials)
+                if logged_in:
+                    self.session_manager.clear_reset_password_session()
+                return logged_in
+            elif "ChallengeName" in tokens:
+                # Handle MFA challenge
+                challenge = tokens.get("ChallengeName")
+                session = tokens.get("Session")
+                
+                # Store username for the MFA challenge
+                st.session_state["auth_username"] = username
+                
+                if challenge == "MFA_SETUP":
+                    # Handle MFA setup challenge
+                    logger.info("MFA setup required")
+                    if self._handle_mfa_setup_challenge(username, session):
+                        self.session_manager.clear_reset_password_session()
+                        self.session_manager.set_mfa_challenge(session, "SETUP")
+                        return True
+                    else:
+                        logger.error("Failed to initiate MFA setup")
+                        self._set_state_logout()
+                        return False
+                else:
+                    logger.error(f"Unsupported challenge: {challenge}")
+                    self._set_state_logout()
+                    return False
+            else:
+                logger.error("Unexpected authentication response")
+                self._set_state_logout()
+                return False
+            
+            #credentials = Credentials.from_tokens(tokens)
+            #logged_in = self._set_state_login(credentials=credentials)
+            #if logged_in:
+            #    self.session_manager.clear_reset_password_session()
+            #return logged_in
+    
+    def _show_mfa_form(self, placeholder):
+        with placeholder:
+            cols = st.columns([1, 3, 1])
+            with cols[1]:
+                with st.form("mfa_form"):
+                    st.subheader("Enter MFA Code")
+                    mfa_type = self.session_manager.get_mfa_type()
+                    st.text(f"Enter the {'SMS' if mfa_type == 'SMS' else 'authenticator app'} code")
+                    code = st.text_input("Code")
+                    mfa_submitted = st.form_submit_button("Verify")
+                    status_container = st.container()
+        return mfa_submitted, code, status_container
+
 
     def login(self) -> bool:
-
         form_placeholder = st.empty()
+
+        # Check if MFA is required
+        if self.session_manager.is_mfa_required():
+            mfa_type = self.session_manager.get_mfa_type()
+        
+            if mfa_type == "SETUP":
+                # Handle MFA setup flow
+                submitted, verification_code = self._show_mfa_setup_form(form_placeholder)
+                if not submitted:
+                    return False
+
+                username = st.session_state.get("auth_username")
+                session = st.session_state.get("auth_mfa_setup_session")
+
+                if not all([username, session, verification_code]):
+                    st.error("Missing MFA setup information")
+                    return False
+
+                if self._verify_mfa_setup(username, session, verification_code):
+                    self.session_manager.clear_mfa_challenge()
+                    st.success("MFA setup completed")
+                    st.rerun()
+                else:
+                    st.error("Invalid verification code")
+                    return False
+            else:
+                # Handle regular MFA verification
+                mfa_submitted, code, status_container = self._show_mfa_form(form_placeholder)
+                if not mfa_submitted:
+                    return False
+
+                username = self.session_manager.get_username()
+                session = self.session_manager.get_mfa_session()
+
+                if not all([username, session, mfa_type, code]):
+                    status_container.error("Missing MFA information")
+                    return False
+
+                is_mfa_valid = self._respond_to_mfa_challenge(
+                    username=username,
+                    code=code,
+                    session=session,
+                    mfa_type=mfa_type
+                )
+
+                if not is_mfa_valid:
+                    status_container.error("Invalid MFA code")
+                    return False
+
+                self.session_manager.clear_mfa_challenge()
+                status_container.success("Logged in")
+                st.rerun()
 
         if self.session_manager.is_reset_password_session():
             logger.info("Password reset is requested")
@@ -496,9 +866,15 @@ class CognitoAuthenticator(CognitoAuthenticatorBase):
                 password=password,
                 new_password=new_password,
             )
+            
             if not is_password_reset:
                 status_container.error("Failed to reset password")
                 return False
+            
+            if self.session_manager.is_mfa_required():
+                status_container.info("MFA Setup required")
+                time.sleep(1.5)
+                st.rerun()
 
             status_container.success("Logged in")
             st.rerun()
@@ -529,16 +905,49 @@ class CognitoAuthenticator(CognitoAuthenticatorBase):
             time.sleep(1.5)
             st.rerun()
 
-        if not is_logged_in:
+        if self.session_manager.is_mfa_required():
+            status_container.info("MFA required")
+            time.sleep(1.5)
+            st.rerun()
+        elif not is_logged_in:
             status_container.error("Invalid username or password")
             return False
-
-        status_container.success("Logged in")
-        st.rerun()
+        else:
+            status_container.success("Logged in")
+            st.rerun()
 
         # should not reach here
         # prevent other code from running
         st.stop()
+    
+    def setup_totp(self, username: str) -> Tuple[bool, Optional[str]]:
+        """Setup TOTP for a user.
+        
+        Returns:
+            Tuple of (success, secret_code)
+            secret_code can be used to generate QR code for authenticator apps
+        """
+        try:
+            response = self.client.associate_software_token(
+                AccessToken=self.session_manager.load_credentials().access_token
+            )
+            secret_code = response.get("SecretCode")
+            return True, secret_code
+        except Exception as e:
+            logger.exception(f"Error setting up TOTP: {e}")
+            return False, None
+
+    def verify_totp_setup(self, code: str) -> bool:
+        """Verify TOTP setup with the provided code."""
+        try:
+            self.client.verify_software_token(
+                AccessToken=self.session_manager.load_credentials().access_token,
+                UserCode=code
+            )
+            return True
+        except Exception as e:
+            logger.exception(f"Error verifying TOTP: {e}")
+            return False
 
 
 

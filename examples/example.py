@@ -11,7 +11,8 @@ authenticator = CognitoAuthenticator(
     pool_id=pool_id,
     app_client_id=app_client_id,
     app_client_secret=app_client_secret,
-    use_cookies=False
+    use_cookies=False,
+    app_name="StreamlitAuthTest"
 )
 
 is_logged_in = authenticator.login()
